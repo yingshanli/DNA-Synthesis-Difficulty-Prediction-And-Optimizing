@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software or dataset, please cite the associated manuscript."
+title: "An interpretable machine-learning framework for predicting and optimizing DNA synthesis difficulty"
+type: software
+authors:
+  - family-names: Li
+    given-names: Yingshan
+repository-code: "https://github.com/yingshanli/DNA-synthesis-difficulty-prediction"
+license: MIT
+version: 0.1.0

@@ -1277,7 +1277,7 @@ language = st.sidebar.selectbox(
     index=0
 )
 
-st.sidebar.caption("App version: 2026-10-09 v12-bundlendlendlendlendlendle")
+st.sidebar.caption("App version: 2026-10-09 v13-bundlendlendlendlendlendlendle")
 ZH = language == "中文"
 
 def L(en: str, zh: str) -> str:
@@ -1390,7 +1390,10 @@ if input_type == L("Single sequence", "单条序列"):
 
     col1, col2 = st.columns(2)
     with col1:
-        predict_btn = st.button(L("🔮 Predict", "🔮 预测"), use_container_width=True)
+        predict_btn = st.button(
+            L("🔮 Predict", "🔮 预测"),
+            use_container_width=True
+        )
     with col2:
         optimize_btn = st.button(
             L("🧬 Optimize & predict", "🧬 优化并预测"),
@@ -1398,89 +1401,145 @@ if input_type == L("Single sequence", "单条序列"):
             use_container_width=True
         )
 
-    if predict_btn or optimize_btn:
+    # Parse the current sequence on every Streamlit rerun.
+    # This is required because interacting with a selectbox causes a full rerun,
+    # while st.button() returns False on that rerun.
+    seq = None
+    if raw_seq.strip():
         try:
             seq = parse_sequence_input(raw_seq)
         except ValueError as e:
-            st.error(str(e))
-            seq = None
+            # Only show parsing errors after the user explicitly clicks an action.
+            if predict_btn or optimize_btn:
+                st.error(str(e))
 
-        if seq:
-            with st.spinner(L("Calculating...", "计算中...")):
-                if predict_btn:
-                    try:
-                        pred = predict_sequence(seq, pipeline, full_features, log_transform_used, pre_scaler=pre_scaler)
-                        pred_int = int(round(pred))
-                        st.metric(
-                            L("Predicted synthesis duration", "预测合成周期"),
-                            L(f"{pred_int} days", f"{pred_int} 天")
-                        )
-                        category = classify_duration(pred_int)
-                        if ZH:
-                            category = category.replace("Low", "简单").replace("Moderate", "中等").replace("High", "困难")
-                        st.info(L("Difficulty category: ", "难度等级：") + category)
-                        show_feature_table(seq, full_features, zh=ZH)
-                    except Exception as e:
-                        st.error(L("Prediction failed: ", "预测失败：") + str(e))
+    # If the input sequence changes, discard optimization results belonging
+    # to the previous sequence.
+    if seq is not None:
+        saved_input = st.session_state.get("optimization_input_sequence")
+        if saved_input is not None and saved_input != seq:
+            clear_optimization_result()
+            st.session_state.pop("selected_checkpoint_idx", None)
+            st.session_state.pop("checkpoint_selector", None)
+            st.session_state.pop("selected_checkpoint_sequence_display", None)
 
-                elif optimize_btn and enable_optimization:
-                    try:
-                        progress_container = st.empty()
-                        status_text = st.empty()
-                        progress_bar = progress_container.progress(
-                            0,
-                            text=L(
-                                "🔄 Initializing model-guided optimization...",
-                                "🔄 初始化模型引导优化..."
-                            )
-                        )
-
-                        result = optimize_and_predict_single(
-                            seq,
-                            pipeline,
-                            full_features,
-                            log_transform_used,
-                            pre_scaler=pre_scaler,
-                            target_reduction=st.session_state.get('target_reduction', 0.10),
-                            max_iterations=max_iter,
-                            progress_bar=progress_bar,
-                            status_text=status_text
-                        )
-
-                        progress_container.empty()
-                        status_text.empty()
-
-                        # Persist results so checkpoint selection survives Streamlit reruns.
-                        save_optimization_result(result, seq)
-                        st.session_state["selected_checkpoint_idx"] = (
-                            max(
-                                0,
-                                len(
-                                    [
-                                        h for h in result.get('metrics', {}).get('checkpoint_history', [])
-                                        if h.get('sequence') and h.get('predicted_duration') is not None
-                                    ]
-                                ) - 1
-                            )
-                        )
-
-                    except Exception as e:
-                        error_result = {'error': str(e)}
-                        save_optimization_result(error_result, seq)
-
-            # Render saved optimization results on every rerun.
-            # This is essential because interacting with the checkpoint selectbox
-            # triggers a Streamlit rerun.
-            saved_result = st.session_state.get("optimization_result")
-            saved_input = st.session_state.get("optimization_input_sequence")
-
-            if saved_result is not None and saved_input == seq:
-                render_optimization_result(
-                    saved_result,
+    # Run prediction only when the Predict button is clicked.
+    if predict_btn and seq:
+        with st.spinner(L("Calculating...", "计算中...")):
+            try:
+                pred = predict_sequence(
+                    seq,
+                    pipeline,
                     full_features,
-                    zh=ZH
+                    log_transform_used,
+                    pre_scaler=pre_scaler
+                )
+                pred_int = int(round(pred))
+                st.metric(
+                    L("Predicted synthesis duration", "预测合成周期"),
+                    L(f"{pred_int} days", f"{pred_int} 天")
+                )
+                category = classify_duration(pred_int)
+                if ZH:
+                    category = (
+                        category
+                        .replace("Low", "简单")
+                        .replace("Moderate", "中等")
+                        .replace("High", "困难")
+                    )
+                st.info(
+                    L("Difficulty category: ", "难度等级：")
+                    + category
+                )
+                show_feature_table(seq, full_features, zh=ZH)
+            except Exception as e:
+                st.error(
+                    L("Prediction failed: ", "预测失败：")
+                    + str(e)
                 )
 
+    # Run optimization only when the Optimize button is clicked.
+    if optimize_btn and enable_optimization and seq:
+        try:
+            progress_container = st.empty()
+            status_text = st.empty()
+            progress_bar = progress_container.progress(
+                0,
+                text=L(
+                    "🔄 Initializing model-guided optimization...",
+                    "🔄 初始化模型引导优化..."
+                )
+            )
+
+            result = optimize_and_predict_single(
+                seq,
+                pipeline,
+                full_features,
+                log_transform_used,
+                pre_scaler=pre_scaler,
+                target_reduction=st.session_state.get(
+                    'target_reduction',
+                    0.10
+                ),
+                max_iterations=max_iter,
+                progress_bar=progress_bar,
+                status_text=status_text
+            )
+
+            progress_container.empty()
+            status_text.empty()
+
+            save_optimization_result(result, seq)
+
+            valid_history = [
+                h
+                for h in result.get(
+                    'metrics',
+                    {}
+                ).get('checkpoint_history', [])
+                if (
+                    h.get('sequence')
+                    and h.get('predicted_duration') is not None
+                )
+            ]
+
+            default_idx = max(0, len(valid_history) - 1)
+            st.session_state["selected_checkpoint_idx"] = default_idx
+
+            # Reset the widget value so it is synchronized with a new result.
+            st.session_state.pop("checkpoint_selector", None)
+            st.session_state.pop(
+                "selected_checkpoint_sequence_display",
+                None
+            )
+
+        except Exception as e:
+            save_optimization_result(
+                {'error': str(e)},
+                seq
+            )
+
+    # IMPORTANT:
+    # Render saved optimization output OUTSIDE the button-click conditions.
+    # Selecting a checkpoint causes Streamlit to rerun the script; on that rerun
+    # both buttons are False, but the result in session_state remains available.
+    if seq is not None:
+        saved_result = st.session_state.get(
+            "optimization_result"
+        )
+        saved_input = st.session_state.get(
+            "optimization_input_sequence"
+        )
+
+        if (
+            saved_result is not None
+            and saved_input == seq
+        ):
+            render_optimization_result(
+                saved_result,
+                full_features,
+                zh=ZH
+            )
 
 # ---------------- Batch upload ----------------
 else:

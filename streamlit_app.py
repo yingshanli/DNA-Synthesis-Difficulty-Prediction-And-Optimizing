@@ -665,11 +665,9 @@ def optimize_single_sequence(
         # Only structurally acceptable candidates are considered.
         structural_results = [r for r in round_results if r['structural_ok']]
 
-        if not structural_results:
-            break
-
-        # Enforce strict monotonic improvement in predicted duration:
-        # every reported checkpoint must be better than the previous checkpoint.
+        # The search should always attempt all configured rounds unless the
+        # target reduction is reached. A round with no improvement therefore
+        # does NOT terminate the search.
         previous_best_pred = history[-1]['predicted_duration']
 
         improving_results = [
@@ -677,48 +675,62 @@ def optimize_single_sequence(
             if r['predicted_duration'] < previous_best_pred - 1e-9
         ]
 
-        # If no candidate improves on the previous checkpoint, stop the search
-        # rather than accepting a worse intermediate round.
-        if not improving_results:
-            break
-
-        best_round = min(
-            improving_results,
-            key=lambda r: (
-                r['predicted_duration'],
-                -r['MFE'],
-                r['high_risk_SIRs']
+        if improving_results:
+            # Record only accepted checkpoints. Because only improving
+            # candidates are appended, displayed checkpoints are strictly
+            # monotonic in predicted duration.
+            best_round = min(
+                improving_results,
+                key=lambda r: (
+                    r['predicted_duration'],
+                    -r['MFE'],
+                    r['high_risk_SIRs']
+                )
             )
-        )
 
-        history.append({
-            'round': round_idx,
-            'predicted_duration': best_round['predicted_duration'],
-            'reduction_pct': best_round['reduction_pct'],
-            'MFE': best_round['MFE'],
-            'high_risk_SIRs': best_round['high_risk_SIRs'],
-            'qualifies': best_round['qualifies'],
-            'sequence': best_round['sequence']
-        })
+            history.append({
+                'round': round_idx,
+                'predicted_duration': best_round['predicted_duration'],
+                'reduction_pct': best_round['reduction_pct'],
+                'MFE': best_round['MFE'],
+                'high_risk_SIRs': best_round['high_risk_SIRs'],
+                'qualifies': best_round['qualifies'],
+                'sequence': best_round['sequence']
+            })
 
-        if best_qualifying is not None:
-            break
+            # If the current accepted checkpoint reaches the requested target,
+            # it can be returned immediately.
+            if best_round['qualifies']:
+                best_qualifying = best_round
+                break
 
-        # Continue only from candidates that also improve on the previous
-        # checkpoint. This guarantees a monotonically decreasing trajectory.
-        ranked = sorted(
-            improving_results,
-            key=lambda r: (
-                r['predicted_duration'],
-                -r['MFE'],
-                r['high_risk_SIRs']
+            # Continue the next search round from the best accepted improving
+            # candidates.
+            ranked = sorted(
+                improving_results,
+                key=lambda r: (
+                    r['predicted_duration'],
+                    -r['MFE'],
+                    r['high_risk_SIRs']
+                )
             )
-        )
 
-        beam = [
-            (r['predicted_duration'], r['sequence'], r['features'], r['high_risk_SIRs'])
-            for r in ranked[:beam_width]
-        ]
+            beam = [
+                (
+                    r['predicted_duration'],
+                    r['sequence'],
+                    r['features'],
+                    r['high_risk_SIRs']
+                )
+                for r in ranked[:beam_width]
+            ]
+
+        else:
+            # No improvement was found in this round. Keep the current accepted
+            # beam and try again in the next round with newly generated random
+            # synonymous candidates. This allows the optimizer to use the full
+            # user-configured search budget instead of stopping after 1-2 rounds.
+            continue
 
     if best_qualifying is None:
         return input_dna, {
@@ -741,7 +753,8 @@ def optimize_single_sequence(
             'original_protein': protein_seq,
             'optimized_protein': protein_seq,
             'checkpoint_history': history,
-            'target_reduction': target_reduction
+            'target_reduction': target_reduction,
+            'search_rounds_attempted': max_rounds
         }
 
     final_seq = best_qualifying['sequence']
@@ -771,7 +784,8 @@ def optimize_single_sequence(
         'original_protein': protein_seq,
         'optimized_protein': final_protein,
         'checkpoint_history': history,
-        'target_reduction': target_reduction
+        'target_reduction': target_reduction,
+        'search_rounds_attempted': round_idx
     }
 
 
@@ -1043,6 +1057,13 @@ def render_optimization_result(
         ))
         show_optimization_comparison(result, zh=zh)
 
+    attempted_rounds = metrics.get('search_rounds_attempted')
+    if attempted_rounds is not None:
+        st.caption(T(
+            f"Search rounds attempted: {attempted_rounds}. Only rounds that produced a strictly better accepted checkpoint are listed below.",
+            f"实际搜索轮数：{attempted_rounds}。下表仅显示产生严格更优已接受检查点的轮次。"
+        ))
+
     if valid_history:
         history_df = pd.DataFrame([
             {
@@ -1282,7 +1303,7 @@ language = st.sidebar.selectbox(
     index=0
 )
 
-st.sidebar.caption("App version: 2026-10-09 v14-bundlendlendlendlendlendlendlendle")
+st.sidebar.caption("App version: 2026-10-09 v15-bundlendlendlendlendlendlendlendlendle")
 ZH = language == "中文"
 
 def L(en: str, zh: str) -> str:
@@ -1324,12 +1345,12 @@ enable_optimization = st.sidebar.checkbox(
 if enable_optimization:
     st.sidebar.info(L(
         "Optimization strategy:\n"
-        "- Primary objective: monotonically reduce model-predicted duration; target ≥10%\n"
+        "- Primary objective: search all configured rounds and retain only strictly improving checkpoints; target ≥10%\n"
         "- MFE should become less negative\n"
         "- High-risk SIRs must not increase\n"
         "- Preserve the encoded amino-acid sequence",
         "优化策略：\n"
-        "- 首要目标：逐轮降低模型预测合成周期；目标至少降低 10%\n"
+        "- 首要目标：完成设定搜索轮数，仅保留严格改善的检查点；目标至少降低 10%\n"
         "- MFE 变得更不负\n"
         "- 高风险 SIR 不增加\n"
         "- 不改变编码的氨基酸序列"

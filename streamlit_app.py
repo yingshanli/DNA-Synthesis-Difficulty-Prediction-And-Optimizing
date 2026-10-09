@@ -662,25 +662,28 @@ def optimize_single_sequence(
         if not round_results:
             break
 
-        # Only structurally acceptable candidates are allowed to define the
-        # reported checkpoint and the next beam. This prevents the search
-        # trajectory from drifting toward more-negative MFE values.
+        # Only structurally acceptable candidates are considered.
         structural_results = [r for r in round_results if r['structural_ok']]
 
         if not structural_results:
-            history.append({
-                'round': round_idx,
-                'predicted_duration': None,
-                'reduction_pct': None,
-                'MFE': None,
-                'high_risk_SIRs': None,
-                'qualifies': False,
-                'sequence': None
-            })
+            break
+
+        # Enforce strict monotonic improvement in predicted duration:
+        # every reported checkpoint must be better than the previous checkpoint.
+        previous_best_pred = history[-1]['predicted_duration']
+
+        improving_results = [
+            r for r in structural_results
+            if r['predicted_duration'] < previous_best_pred - 1e-9
+        ]
+
+        # If no candidate improves on the previous checkpoint, stop the search
+        # rather than accepting a worse intermediate round.
+        if not improving_results:
             break
 
         best_round = min(
-            structural_results,
+            improving_results,
             key=lambda r: (
                 r['predicted_duration'],
                 -r['MFE'],
@@ -701,8 +704,10 @@ def optimize_single_sequence(
         if best_qualifying is not None:
             break
 
+        # Continue only from candidates that also improve on the previous
+        # checkpoint. This guarantees a monotonically decreasing trajectory.
         ranked = sorted(
-            structural_results,
+            improving_results,
             key=lambda r: (
                 r['predicted_duration'],
                 -r['MFE'],
@@ -1277,7 +1282,7 @@ language = st.sidebar.selectbox(
     index=0
 )
 
-st.sidebar.caption("App version: 2026-10-09 v13-bundlendlendlendlendlendlendle")
+st.sidebar.caption("App version: 2026-10-09 v14-bundlendlendlendlendlendlendlendle")
 ZH = language == "中文"
 
 def L(en: str, zh: str) -> str:
@@ -1319,12 +1324,12 @@ enable_optimization = st.sidebar.checkbox(
 if enable_optimization:
     st.sidebar.info(L(
         "Optimization strategy:\n"
-        "- Primary objective: ≥10% lower model-predicted duration\n"
+        "- Primary objective: monotonically reduce model-predicted duration; target ≥10%\n"
         "- MFE should become less negative\n"
         "- High-risk SIRs must not increase\n"
         "- Preserve the encoded amino-acid sequence",
         "优化策略：\n"
-        "- 首要目标：模型预测合成周期至少降低 10%\n"
+        "- 首要目标：逐轮降低模型预测合成周期；目标至少降低 10%\n"
         "- MFE 变得更不负\n"
         "- 高风险 SIR 不增加\n"
         "- 不改变编码的氨基酸序列"

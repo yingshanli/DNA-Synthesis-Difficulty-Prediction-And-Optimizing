@@ -33,7 +33,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 from itertools import product
 
 CANONICAL_FEATURES = (
-    ['log_length'] +
+    ['length'] +
     ['A_ratio', 'G_ratio', 'C_ratio', 'T_ratio'] +
     [''.join(p) for p in product('AGCT', repeat=2)] +
     [''.join(p).lower() for p in product('ACGT', repeat=3)] +
@@ -74,6 +74,14 @@ def load_model():
     full_features = list(bundle["feature_columns"])
     log_transform_used = bool(bundle.get("target_log_transform", False))
 
+    # Fail early with a clear message if an old bundle is accidentally used.
+    if "length" not in full_features:
+        st.error(
+            "❌ This app requires the corrected model bundle with the raw sequence-length "
+            "feature named 'length'. Please regenerate or replace the old bundle."
+        )
+        st.stop()
+
     return bundle, pre_scaler, pipeline, full_features, log_transform_used
 
 # ============================================================
@@ -92,11 +100,9 @@ def calculate_all_features(seq: str) -> dict:
     features = {}
 
     # ---- 1. 基础特征 ----
-    # The training workflow used ln(sequence length); all valid DNA sequences have length > 0.
-    # IMPORTANT: the currently trained model uses raw sequence length in the
-    # feature column named 'log_length'. Keep the historical column name
-    # for compatibility with dna_synthesis_model_bundle.pkl.
-    features['log_length'] = float(length)
+    # Raw sequence length in base pairs. The corrected deployment bundle
+    # uses the canonical feature name 'length'.
+    features['length'] = float(length)
 
     a = seq.count('A')
     c = seq.count('C')
@@ -306,7 +312,7 @@ def show_feature_table(seq: str, full_features: List[str], zh: bool = False):
 
     st.subheader(T("📊 Calculated features", "📊 计算的特征"))
 
-    base_features = ['log_length', 'A_ratio', 'G_ratio', 'C_ratio', 'T_ratio']
+    base_features = ['length', 'A_ratio', 'G_ratio', 'C_ratio', 'T_ratio']
     dinuc_features = ['AA','AG','AC','AT','GA','GG','GC','GT','CA','CG','CC','CT','TA','TG','TC','TT']
     trinuc_features = [''.join(p).lower() for p in product('ACGT', repeat=3)]
     repeat_features = ['max_repeat_len', 'repeat_density']
@@ -317,9 +323,6 @@ def show_feature_table(seq: str, full_features: List[str], zh: bool = False):
 
     with st.expander(T("📈 Base features", "📈 基础特征"), expanded=True):
         base_df = df[base_features].copy()
-        # The trained bundle uses raw sequence length in the legacy field 'log_length'.
-        # Show the scientifically correct label in the UI without changing the model key.
-        base_df = base_df.rename(columns={'log_length': 'length'})
         format_map = {
             'length': '{:.0f}',
             'A_ratio': '{:.4f}',
@@ -348,7 +351,7 @@ def show_feature_table(seq: str, full_features: List[str], zh: bool = False):
         st.dataframe(df[secondary_features].style.format("{:.4f}"))
 
     with st.expander(T("📋 All features", "📋 所有特征")):
-        all_display = df.copy().rename(columns={'log_length': 'length'})
+        all_display = df.copy()
         format_map_all = {c: "{:.4f}" for c in all_display.columns}
         if 'length' in format_map_all:
             format_map_all['length'] = "{:.0f}"
@@ -476,47 +479,93 @@ def generate_synonymous_candidates(
     protein_seq: str,
     stop_set: set,
     rng: np.random.Generator,
-    n_candidates: int = 60,
-    min_changes: int = 3,
-    max_changes: int = 18
+    n_candidates: int = 150,
+    local_fraction_range: tuple = (0.05, 0.10),
+    medium_fraction_range: tuple = (0.10, 0.20),
+    global_fraction_range: tuple = (0.20, 0.40)
 ) -> List[str]:
-    """Generate diverse protein-preserving synonymous variants."""
+    """
+    Generate diverse protein-preserving synonymous variants using
+    proportional mutation scales based on the number of mutable codons.
+
+    Candidate allocation:
+      - Local:  20% of candidates; modify 5-10% of mutable codons
+      - Medium: 50% of candidates; modify 10-20% of mutable codons
+      - Global: 30% of candidates; modify 20-40% of mutable codons
+
+    This keeps search intensity comparable across CDS lengths and avoids
+    overly conservative fixed-codon mutation counts.
+    """
     positions = []
+
     for i, aa in enumerate(protein_seq):
         start = i * 3
         if start in stop_set or aa == '*':
             continue
+
         current = seed_seq[start:start+3]
         alternatives = [c for c in codon_table.get(aa, []) if c != current]
+
         if alternatives:
             positions.append((i, alternatives))
 
     if not positions:
         return []
 
-    max_changes = min(max_changes, len(positions))
-    min_changes = min(min_changes, max_changes)
-
+    n_mutable = len(positions)
     candidates = set()
-    for _ in range(max(n_candidates * 4, 100)):
-        if len(candidates) >= n_candidates:
-            break
 
-        k = int(rng.integers(min_changes, max_changes + 1))
-        selected = rng.choice(len(positions), size=k, replace=False)
+    # 20% Local / 50% Medium / 30% Global
+    n_local = max(1, int(round(n_candidates * 0.20)))
+    n_medium = max(1, int(round(n_candidates * 0.50)))
+    n_global = max(1, n_candidates - n_local - n_medium)
+
+    def fraction_to_k(frac_range):
+        low_f, high_f = frac_range
+        low_k = max(1, int(round(low_f * n_mutable)))
+        high_k = max(low_k, int(round(high_f * n_mutable)))
+        high_k = min(high_k, n_mutable)
+        low_k = min(low_k, high_k)
+        return low_k, high_k
+
+    local_lo, local_hi = fraction_to_k(local_fraction_range)
+    medium_lo, medium_hi = fraction_to_k(medium_fraction_range)
+    global_lo, global_hi = fraction_to_k(global_fraction_range)
+
+    def make_candidate(k: int):
+        k = max(1, min(int(k), n_mutable))
+        selected = rng.choice(n_mutable, size=k, replace=False)
+
         chars = list(seed_seq)
-
         for idx in selected:
             codon_i, alternatives = positions[idx]
             new_codon = alternatives[int(rng.integers(0, len(alternatives)))]
             s = codon_i * 3
             chars[s:s+3] = list(new_codon)
 
-        candidate = ''.join(chars)
-        if candidate != seed_seq:
-            candidates.add(candidate)
+        return ''.join(chars)
 
-    return list(candidates)
+    def fill_group(target_added, lo, hi):
+        start_count = len(candidates)
+        attempts = 0
+        max_attempts = max(100, target_added * 10)
+
+        while (len(candidates) - start_count) < target_added and attempts < max_attempts:
+            attempts += 1
+            if hi <= lo:
+                k = lo
+            else:
+                k = int(rng.integers(lo, hi + 1))
+
+            candidate = make_candidate(k)
+            if candidate != seed_seq:
+                candidates.add(candidate)
+
+    fill_group(n_local, local_lo, local_hi)
+    fill_group(n_medium, medium_lo, medium_hi)
+    fill_group(n_global, global_lo, global_hi)
+
+    return list(candidates)[:n_candidates]
 
 
 def proxy_candidate_score(seq: str, original_gc: float) -> float:
@@ -539,9 +588,9 @@ def optimize_single_sequence(
     feature_callback,
     target_reduction: float = 0.10,
     max_rounds: int = 5,
-    beam_width: int = 3,
-    generated_per_seed: int = 60,
-    full_evaluations_per_seed: int = 8,
+    beam_width: int = 5,
+    generated_per_seed: int = 150,
+    full_evaluations_per_seed: int = 15,
     random_seed: int = 42,
     progress_callback=None
 ) -> Tuple[Optional[str], Dict]:
@@ -602,8 +651,9 @@ def optimize_single_sequence(
                 stop_set=stop_set,
                 rng=rng,
                 n_candidates=generated_per_seed,
-                min_changes=3,
-                max_changes=min(18, max(8, len(seed_seq) // 90))
+                local_fraction_range=(0.05, 0.10),
+                medium_fraction_range=(0.10, 0.20),
+                global_fraction_range=(0.20, 0.40)
             )
 
             ranked_proxy = sorted(
@@ -754,7 +804,10 @@ def optimize_single_sequence(
             'optimized_protein': protein_seq,
             'checkpoint_history': history,
             'target_reduction': target_reduction,
-            'search_rounds_attempted': max_rounds
+            'search_rounds_attempted': max_rounds,
+            'beam_width': beam_width,
+            'generated_per_seed': generated_per_seed,
+            'full_evaluations_per_seed': full_evaluations_per_seed
         }
 
     final_seq = best_qualifying['sequence']
@@ -785,7 +838,10 @@ def optimize_single_sequence(
         'optimized_protein': final_protein,
         'checkpoint_history': history,
         'target_reduction': target_reduction,
-        'search_rounds_attempted': round_idx
+        'search_rounds_attempted': round_idx,
+        'beam_width': beam_width,
+        'generated_per_seed': generated_per_seed,
+        'full_evaluations_per_seed': full_evaluations_per_seed
     }
 
 
@@ -797,6 +853,9 @@ def optimize_and_predict_single(
     pre_scaler,
     target_reduction: float = 0.10,
     max_iterations: int = 5,
+    beam_width: int = 5,
+    generated_per_seed: int = 150,
+    full_evaluations_per_seed: int = 15,
     progress_bar=None,
     status_text=None
 ) -> Dict:
@@ -828,9 +887,9 @@ def optimize_and_predict_single(
         feature_callback=feature_callback,
         target_reduction=target_reduction,
         max_rounds=max_iterations,
-        beam_width=3,
-        generated_per_seed=60,
-        full_evaluations_per_seed=8,
+        beam_width=beam_width,
+        generated_per_seed=generated_per_seed,
+        full_evaluations_per_seed=full_evaluations_per_seed,
         random_seed=42,
         progress_callback=update_progress
     )
@@ -1060,8 +1119,8 @@ def render_optimization_result(
     attempted_rounds = metrics.get('search_rounds_attempted')
     if attempted_rounds is not None:
         st.caption(T(
-            f"Search rounds attempted: {attempted_rounds}. Only rounds that produced a strictly better accepted checkpoint are listed below.",
-            f"实际搜索轮数：{attempted_rounds}。下表仅显示产生严格更优已接受检查点的轮次。"
+            f"Search rounds attempted: {attempted_rounds}. Beam width: {metrics.get('beam_width', 'N/A')}; generated/seed: {metrics.get('generated_per_seed', 'N/A')}; full evaluations/seed: {metrics.get('full_evaluations_per_seed', 'N/A')}. Only strictly improved checkpoints are listed below.",
+            f"实际搜索轮数：{attempted_rounds}。Beam宽度：{metrics.get('beam_width', 'N/A')}；每个起点生成：{metrics.get('generated_per_seed', 'N/A')}；每个起点完整评估：{metrics.get('full_evaluations_per_seed', 'N/A')}。下表仅显示严格改善的检查点。"
         ))
 
     if valid_history:
@@ -1303,7 +1362,7 @@ language = st.sidebar.selectbox(
     index=0
 )
 
-st.sidebar.caption("App version: 2026-10-09 v15-bundlendlendlendlendlendlendlendlendle")
+st.sidebar.caption("App version: 2026-10-09 v18-bundle")
 ZH = language == "中文"
 
 def L(en: str, zh: str) -> str:
@@ -1345,12 +1404,12 @@ enable_optimization = st.sidebar.checkbox(
 if enable_optimization:
     st.sidebar.info(L(
         "Optimization strategy:\n"
-        "- Primary objective: search all configured rounds and retain only strictly improving checkpoints; target ≥10%\n"
+        "- Multi-scale synonymous search: Local 5–10%, Medium 10–20%, Global 20–40% of mutable codons; candidate mix 20%/50%/30%\n- Primary objective: search all configured rounds and retain only strictly improving checkpoints; target ≥10%\n"
         "- MFE should become less negative\n"
         "- High-risk SIRs must not increase\n"
         "- Preserve the encoded amino-acid sequence",
         "优化策略：\n"
-        "- 首要目标：完成设定搜索轮数，仅保留严格改善的检查点；目标至少降低 10%\n"
+        "- 多尺度同义搜索：Local 修改 5–10%、Medium 10–20%、Global 20–40% 的可变密码子；候选比例为 20%/50%/30%\n- 首要目标：完成设定搜索轮数，仅保留严格改善的检查点；目标至少降低 10%\n"
         "- MFE 变得更不负\n"
         "- 高风险 SIR 不增加\n"
         "- 不改变编码的氨基酸序列"
@@ -1362,6 +1421,39 @@ if enable_optimization:
         max_value=8,
         value=5
     )
+
+    search_intensity = st.sidebar.select_slider(
+        L("Search intensity", "搜索强度"),
+        options=["Standard", "Deep", "Very deep"],
+        value="Deep",
+        help=L(
+            "Higher settings explore more synonymous variants but require more computation.",
+            "更高的搜索强度会探索更多同义变体，但计算时间也会增加。"
+        )
+    )
+
+    if search_intensity == "Standard":
+        search_beam_width = 3
+        search_generated_per_seed = 60
+        search_full_evaluations = 8
+    elif search_intensity == "Deep":
+        search_beam_width = 5
+        search_generated_per_seed = 150
+        search_full_evaluations = 15
+    else:
+        search_beam_width = 7
+        search_generated_per_seed = 300
+        search_full_evaluations = 25
+
+    st.sidebar.caption(L(
+        f"Beam width: {search_beam_width} | Generated/seed: {search_generated_per_seed} | Full evaluations/seed: {search_full_evaluations}",
+        f"Beam宽度：{search_beam_width} | 每个起点生成：{search_generated_per_seed} | 每个起点完整评估：{search_full_evaluations}"
+    ))
+
+    st.sidebar.caption(L(
+        "Mutation scales: Local 5-10%, Medium 10-20%, Global 20-40% of mutable codons; candidate mix 20% / 50% / 30%.",
+        "变异尺度：Local 5–10%、Medium 10–20%、Global 20–40% 的可变密码子；候选比例 20% / 50% / 30%。"
+    ))
 
     target_reduction_pct = st.sidebar.slider(
         L("Required predicted-duration reduction (%)", "要求的预测周期降低幅度（%）"),
@@ -1508,6 +1600,9 @@ if input_type == L("Single sequence", "单条序列"):
                     0.10
                 ),
                 max_iterations=max_iter,
+                beam_width=search_beam_width,
+                generated_per_seed=search_generated_per_seed,
+                full_evaluations_per_seed=search_full_evaluations,
                 progress_bar=progress_bar,
                 status_text=status_text
             )
@@ -1651,6 +1746,9 @@ else:
                                 pre_scaler=pre_scaler,
                                 target_reduction=st.session_state.get('target_reduction', 0.10),
                                 max_iterations=max_iter,
+                                beam_width=search_beam_width,
+                                generated_per_seed=search_generated_per_seed,
+                                full_evaluations_per_seed=search_full_evaluations,
                                 progress_bar=sub_progress,
                                 status_text=sub_status
                             )
